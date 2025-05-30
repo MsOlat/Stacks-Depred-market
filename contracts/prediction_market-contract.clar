@@ -140,3 +140,63 @@
         (update-user-stats tx-sender u0 true false)
         (var-set next-market-id (+ market-id u1))
         (ok market-id)))
+
+;; Place a bet on a market outcome
+(define-public (place-bet (market-id uint) (outcome uint) (amount uint))
+    (let ((market-opt (map-get? markets market-id))
+          (existing-position (map-get? user-positions {market-id: market-id, user: tx-sender, outcome: outcome})))
+        (asserts! (not (var-get paused)) ERR_NOT_AUTHORIZED)
+        (asserts! (is-some market-opt) ERR_MARKET_NOT_FOUND)
+        (asserts! (is-valid-outcome outcome) ERR_INVALID_OUTCOME)
+        (asserts! (> amount u0) ERR_INSUFFICIENT_FUNDS)
+        
+        (let ((market (unwrap-panic market-opt)))
+            (asserts! (< block-height (get end-block market)) ERR_MARKET_CLOSED)
+            (asserts! (not (get resolved market)) ERR_MARKET_RESOLVED)
+            
+            ;; Transfer STX from user
+            (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+            
+            ;; Update market pools
+            (let ((new-market (if (is-eq outcome u1)
+                                (merge market {total-pool-a: (+ (get total-pool-a market) amount)})
+                                (merge market {total-pool-b: (+ (get total-pool-b market) amount)}))))
+                (map-set markets market-id new-market)
+                
+                ;; Update user position
+                (let ((new-amount (+ amount (default-to u0 (get amount existing-position)))))
+                    (map-set user-positions {market-id: market-id, user: tx-sender, outcome: outcome} {
+                        amount: new-amount,
+                        claimed: false
+                    }))
+                
+                ;; Update statistics
+                (let ((stats (default-to {total-volume: u0, total-participants: u0, fees-collected: u0}
+                                       (map-get? market-stats market-id))))
+                    (map-set market-stats market-id {
+                        total-volume: (+ (get total-volume stats) amount),
+                        total-participants: (if (is-none existing-position) (+ (get total-participants stats) u1) (get total-participants stats)),
+                        fees-collected: (get fees-collected stats)
+                    }))
+                
+                (update-user-stats tx-sender amount false (is-none existing-position))
+                (ok true)))))
+
+;; Resolve a market (only creator or contract owner)
+(define-public (resolve-market (market-id uint) (winning-outcome uint))
+    (let ((market-opt (map-get? markets market-id)))
+        (asserts! (is-some market-opt) ERR_MARKET_NOT_FOUND)
+        (asserts! (is-valid-outcome winning-outcome) ERR_INVALID_OUTCOME)
+        
+        (let ((market (unwrap-panic market-opt)))
+            (asserts! (or (is-market-creator market-id) (is-contract-owner)) ERR_NOT_AUTHORIZED)
+            (asserts! (>= block-height (get end-block market)) ERR_MARKET_CLOSED)
+            (asserts! (not (get resolved market)) ERR_MARKET_RESOLVED)
+            
+            (map-set markets market-id (merge market {
+                resolved: true,
+                winning-outcome: (some winning-outcome),
+                resolution-block: block-height
+            }))
+            
+            (ok true)))))
