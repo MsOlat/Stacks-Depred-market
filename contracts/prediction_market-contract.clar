@@ -199,4 +199,123 @@
                 resolution-block: block-height
             }))
             
-            (ok true)))))
+            (ok true))))
+
+;; Claim winnings from a resolved market
+(define-public (claim-winnings (market-id uint) (outcome uint))
+    (let ((market-opt (map-get? markets market-id))
+          (position-opt (map-get? user-positions {market-id: market-id, user: tx-sender, outcome: outcome})))
+        (asserts! (is-some market-opt) ERR_MARKET_NOT_FOUND)
+        (asserts! (is-some position-opt) ERR_NO_POSITION)
+        
+        (let ((market (unwrap-panic market-opt))
+              (position (unwrap-panic position-opt)))
+            (asserts! (get resolved market) ERR_MARKET_NOT_RESOLVED)
+            (asserts! (not (get claimed position)) ERR_ALREADY_CLAIMED)
+            (asserts! (is-eq (some outcome) (get winning-outcome market)) ERR_INVALID_OUTCOME)
+            
+            (let ((bet-amount (get amount position))
+                  (winning-pool (if (is-eq outcome u1) (get total-pool-a market) (get total-pool-b market)))
+                  (losing-pool (if (is-eq outcome u1) (get total-pool-b market) (get total-pool-a market)))
+                  (gross-payout (calculate-payout bet-amount winning-pool losing-pool))
+                  (platform-fee (calculate-fee gross-payout PLATFORM_FEE_PERCENTAGE))
+                  (creator-fee (calculate-fee gross-payout (get creator-fee market)))
+                  (net-payout (- gross-payout (+ platform-fee creator-fee))))
+                
+                ;; Mark as claimed
+                (map-set user-positions {market-id: market-id, user: tx-sender, outcome: outcome}
+                    (merge position {claimed: true}))
+                
+                ;; Transfer winnings
+                (try! (as-contract (stx-transfer? net-payout tx-sender tx-sender)))
+                
+                ;; Transfer fees
+                (try! (as-contract (stx-transfer? platform-fee tx-sender (var-get platform-fee-recipient))))
+                (try! (as-contract (stx-transfer? creator-fee tx-sender (get creator market))))
+                
+                ;; Update statistics
+                (let ((stats (default-to {total-volume: u0, total-participants: u0, fees-collected: u0}
+                                       (map-get? market-stats market-id))))
+                    (map-set market-stats market-id (merge stats {
+                        fees-collected: (+ (get fees-collected stats) platform-fee creator-fee)
+                    })))
+                
+                (update-winner-stats tx-sender net-payout)
+                (ok net-payout)))))
+
+;; Get market information
+(define-read-only (get-market (market-id uint))
+    (map-get? markets market-id))
+
+;; Get user position
+(define-read-only (get-user-position (market-id uint) (user principal) (outcome uint))
+    (map-get? user-positions {market-id: market-id, user: user, outcome: outcome}))
+
+;; Get market statistics
+(define-read-only (get-market-stats (market-id uint))
+    (map-get? market-stats market-id))
+
+;; Get user statistics
+(define-read-only (get-user-stats (user principal))
+    (map-get? user-stats user))
+
+;; Get market odds
+(define-read-only (get-market-odds (market-id uint))
+    (match (map-get? markets market-id)
+        market (let ((pool-a (get total-pool-a market))
+                     (pool-b (get total-pool-b market))
+                     (total-pool (+ pool-a pool-b)))
+                 (if (is-eq total-pool u0)
+                     (ok {odds-a: u5000, odds-b: u5000}) ;; 50-50 if no bets
+                     (ok {odds-a: (/ (* pool-b u10000) total-pool),
+                          odds-b: (/ (* pool-a u10000) total-pool)})))
+        ERR_MARKET_NOT_FOUND))
+
+;; Calculate potential payout
+(define-read-only (calculate-potential-payout (market-id uint) (outcome uint) (bet-amount uint))
+    (match (map-get? markets market-id)
+        market (let ((winning-pool (if (is-eq outcome u1) (get total-pool-a market) (get total-pool-b market)))
+                     (losing-pool (if (is-eq outcome u1) (get total-pool-b market) (get total-pool-a market)))
+                     (new-winning-pool (+ winning-pool bet-amount))
+                     (gross-payout (calculate-payout bet-amount new-winning-pool losing-pool))
+                     (platform-fee (calculate-fee gross-payout PLATFORM_FEE_PERCENTAGE))
+                     (creator-fee (calculate-fee gross-payout (get creator-fee market))))
+                 (ok (- gross-payout (+ platform-fee creator-fee))))
+        ERR_MARKET_NOT_FOUND))
+
+;; Admin functions
+(define-public (set-platform-fee-recipient (new-recipient principal))
+    (begin
+        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+        (var-set platform-fee-recipient new-recipient)
+        (ok true)))
+
+(define-public (pause-contract)
+    (begin
+        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+        (var-set paused true)
+        (ok true)))
+
+(define-public (unpause-contract)
+    (begin
+        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+        (var-set paused false)
+        (ok true)))
+
+;; Emergency function to resolve stuck markets (only contract owner)
+(define-public (emergency-resolve (market-id uint) (winning-outcome uint))
+    (let ((market-opt (map-get? markets market-id)))
+        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+        (asserts! (is-some market-opt) ERR_MARKET_NOT_FOUND)
+        (asserts! (is-valid-outcome winning-outcome) ERR_INVALID_OUTCOME)
+        
+        (let ((market (unwrap-panic market-opt)))
+            (asserts! (not (get resolved market)) ERR_MARKET_RESOLVED)
+            
+            (map-set markets market-id (merge market {
+                resolved: true,
+                winning-outcome: (some winning-outcome),
+                resolution-block: block-height
+            }))
+            
+            (ok true))))
