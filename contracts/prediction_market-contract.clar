@@ -62,3 +62,81 @@
     total-won: uint,
     markets-participated: uint
 })
+
+;; private functions
+
+(define-private (is-contract-owner)
+    (is-eq tx-sender CONTRACT_OWNER))
+
+(define-private (is-market-creator (market-id uint))
+    (match (map-get? markets market-id)
+        market (is-eq tx-sender (get creator market))
+        false))
+
+(define-private (is-valid-outcome (outcome uint))
+    (or (is-eq outcome u1) (is-eq outcome u2)))
+
+(define-private (calculate-payout (bet-amount uint) (winning-pool uint) (losing-pool uint))
+    (if (is-eq winning-pool u0)
+        bet-amount
+        (/ (* bet-amount (+ winning-pool losing-pool)) winning-pool)))
+
+(define-private (calculate-fee (amount uint) (fee-percentage uint))
+    (/ (* amount fee-percentage) u10000))
+
+(define-private (update-user-stats (user principal) (amount uint) (is-new-market bool) (is-new-participation bool))
+    (let ((current-stats (default-to {markets-created: u0, total-bet: u0, total-won: u0, markets-participated: u0}
+                                   (map-get? user-stats user))))
+        (map-set user-stats user {
+            markets-created: (if is-new-market (+ (get markets-created current-stats) u1) (get markets-created current-stats)),
+            total-bet: (+ (get total-bet current-stats) amount),
+            total-won: (get total-won current-stats),
+            markets-participated: (if is-new-participation (+ (get markets-participated current-stats) u1) (get markets-participated current-stats))
+        })))
+
+(define-private (update-winner-stats (user principal) (winnings uint))
+    (let ((current-stats (default-to {markets-created: u0, total-bet: u0, total-won: u0, markets-participated: u0}
+                                   (map-get? user-stats user))))
+        (map-set user-stats user (merge current-stats {total-won: (+ (get total-won current-stats) winnings)}))))
+
+;; public functions
+
+;; Create a new prediction market
+(define-public (create-market 
+    (question (string-ascii 256))
+    (description (string-ascii 1024))
+    (outcome-a (string-ascii 128))
+    (outcome-b (string-ascii 128))
+    (duration uint)
+    (creator-fee uint))
+    (let ((market-id (var-get next-market-id))
+          (end-block (+ block-height duration)))
+        (asserts! (not (var-get paused)) ERR_NOT_AUTHORIZED)
+        (asserts! (and (>= duration MIN_MARKET_DURATION) (<= duration MAX_MARKET_DURATION)) ERR_INVALID_DURATION)
+        (asserts! (<= creator-fee MAX_FEE_PERCENTAGE) ERR_INVALID_FEE)
+        
+        (map-set markets market-id {
+            creator: tx-sender,
+            question: question,
+            description: description,
+            outcome-a: outcome-a,
+            outcome-b: outcome-b,
+            end-block: end-block,
+            resolution-block: u0,
+            resolved: false,
+            winning-outcome: none,
+            total-pool-a: u0,
+            total-pool-b: u0,
+            creator-fee: creator-fee,
+            created-at: block-height
+        })
+        
+        (map-set market-stats market-id {
+            total-volume: u0,
+            total-participants: u0,
+            fees-collected: u0
+        })
+        
+        (update-user-stats tx-sender u0 true false)
+        (var-set next-market-id (+ market-id u1))
+        (ok market-id)))
